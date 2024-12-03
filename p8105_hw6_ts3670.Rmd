@@ -1,0 +1,186 @@
+---
+title: "p8105_hw6_ts3670"
+author: "Tong Su"
+date: "2024-12-03"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(modelr)
+library(dplyr)
+library(ggplot2)
+library(p8105.datasets)
+library(mgcv)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Problem 2
+
+```{r}
+homicide_df <- read_csv("https://raw.githubusercontent.com/washingtonpost/data-homicides/master/homicide-data.csv") 
+
+homicide_df = homicide_df |>
+  mutate(city_state = paste(city, state, sep = ", "),
+         status = if_else(disposition == "Closed by arrest", 1, 0)
+           ) |>  
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("White", "Black"),
+    victim_age != "Unknown") |>
+  mutate(victim_age = as.numeric(victim_age)) |>
+  select(-city, - state, -disposition)
+```
+By cleaning the data, the `homicide_df` includes `r nrow(homicide_df)` rows and `r ncol(homicide_df)` columns.
+```{r pressure, echo=FALSE}
+baltimore_df = homicide_df |> filter(city_state == "Baltimore, MD")
+
+baltimore_glm = glm(status ~ victim_age + victim_sex + victim_race, 
+                     data = baltimore_df, family = "binomial")
+
+baltimore_result = broom::tidy(baltimore_glm, exponentiate= TRUE, conf.int = TRUE)|>
+  filter(term == "victim_sexMale")|>
+  knitr::kable(digits=4)
+  
+print(baltimore_result)
+```
+Selecting `Baltimore, MD`'s data and fit into binary logistic regression model with `glm` and use variables `victim_age`, `victim_race`, `victim_sex` to make prediction on `solved_case`. 
+```{r}
+city_result = homicide_df |>
+  group_by(city_state) |>
+  nest() |>
+  mutate(
+    glm_model = map(
+      data, ~ glm(status ~ victim_age + victim_sex + victim_race, data = ., family = "binomial")),
+    glm_tidy = map(glm_model, ~ broom::tidy(., conf.int = TRUE))) |>
+  select(city_state, glm_tidy) |>
+  unnest(cols = glm_tidy)
+```
+
+```{r}
+odds_ratios <- city_result |>
+  filter(term == "victim_sexMale") |>
+  mutate(OR = exp(estimate),
+         lower_CI = exp(conf.low),
+         upper_CI = exp(conf.high)) |>
+  select(city_state, OR, lower_CI, upper_CI)
+
+print(odds_ratios)
+```
+
+```{r}
+ggplot(odds_ratios, aes(x = reorder(city_state, OR), y = OR)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Estimated Odds Ratios for Homicides by City",
+    x = "City, State",
+    y = "Odds Ratio (Male vs Female)"
+  ) +
+  theme_minimal()
+```
+
+In the adjusted odds ratio plot, we observe that homicides involving male victims are less likely to be solved compared to those involving female victims in most cities. However, caution is needed for cities where the confidence intervals include 1, as this typically indicates that the result is not statistically significant at the 95% confidence level.
+
+## Problem 3
+```{r}
+bw_df = read_csv("https://p8105.com/data/birthweight.csv") |>
+  mutate(
+      babysex = 
+        recode_factor(babysex, 
+                      `1` = "Male", 
+                      `2` = "Female"),
+      frace = 
+        recode_factor (frace, 
+                       `1` = "White", 
+                       `2` = "Black", 
+                       `3` = "Asian", 
+                       `4` = "Puerto Rican", 
+                       `8` = "Other", 
+                       `9` = "Unknown"),
+      mrace = 
+        recode_factor(mrace, 
+                      `1` = "White", 
+                      `2` = "Black", 
+                      `3` = "Asian", 
+                      `4` = "Puerto Rican", 
+                      `8` = "Other"), 
+      malform = 
+        recode_factor(malform, 
+                      `0` = "Absent", 
+                      `1` = "Present"), 
+  )
+```
+By cleaning the birth weight data, there are `r nrow(bw_df)` rows and `r ncol(bw_df)` columns. 
+```{r}
+sapply(bw_df, function(x) sum(is.na(x)))
+```
+There is no missing value in the cleaned dataset
+
+```{r}
+fit_hypothetical = gam(bwt ~ s(ppwt) + s(gaweeks), data = bw_df)
+```
+
+```{r}
+bw_df = bw_df |>
+  add_predictions(fit_hypothetical) |>
+  add_residuals(fit_hypothetical)
+
+bw_df |>
+  ggplot(aes(x = gaweeks, y = resid)) +
+  geom_point() +
+  labs(
+    x = "Gestational Age",
+    y = "Residuals",
+    title = "Residuals vs Gestational Age"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+set.seed(123)
+
+cv_df = crossv_mc(bw_df, 100) |>
+  mutate(
+    train = map(train, as_tibble),  
+    test = map(test, as_tibble)   
+  )
+
+cv_results = cv_df |>
+  mutate(
+    hypo_model = map(train, ~ gam(bwt ~ s(ppwt) + s(gaweeks), data = .x)),
+    maineff_model = map(train, ~ lm(bwt ~ blength + gaweeks, data = .x)),
+    interact_model = map(train, ~ lm(bwt ~ bhead * blength * babysex, data = .x))
+  ) %>%
+  mutate(
+    rmse_model_maineff = map2_dbl(maineff_model, test, ~ rmse(model = .x, data = .y)),
+    rmse_model_interact = map2_dbl(interact_model, test, ~ rmse(model = .x, data = .y)),
+    rmse_model_hypothesis = map2_dbl(hypo_model, test, ~ rmse(model = .x, data = .y))
+  )
+```
+
+```{r}
+cv_results |>
+  select(starts_with("rmse")) |>
+  pivot_longer(
+    cols = everything(),
+    names_to = "model",
+    values_to = "rmse",
+    names_prefix = "rmse_model_"
+  ) |>
+  mutate(model = fct_inorder(model)) %>%
+  ggplot(aes(x = model, y = rmse)) +
+  geom_violin(trim = FALSE) + 
+  labs(
+    title = "Cross-Validated RMSE Comparison",
+    x = "Model",
+    y = "Root Mean Square Error (RMSE)"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5)  
+  )
+```
+
